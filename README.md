@@ -71,7 +71,7 @@ An in-app **artificial-cloud test** hides part of the clear pixels of a scene as
 
 If you use TerraLens in your work, please cite:
 
-> Deka, K. (2026). *TerraLens: a Google Earth Engine web app for land surface temperature, spectral indices and LULC mapping in India* (v1.9.3) [Software]. GitHub. DOI: *(add Zenodo DOI after the first release)*
+> Deka, K. (2026). *TerraLens: a Google Earth Engine web app for land surface temperature, spectral indices and LULC mapping in India* (v1.9.3) [Software]. GitHub. DOI: *(https://doi.org/10.5281/zenodo.23898056)*
 
 ## What's new in v1.9.3
 
