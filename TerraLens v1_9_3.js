@@ -371,6 +371,7 @@ stDcaAdvCheck.onChange(function(on) { stDcaAdvPanel.style().set('shown', on); })
 
 var stDcaMethodNote = note('How ST-DCA works: Pairs each Landsat scene with the exact ERA5-Land hour (±60 min), blends local (3 km) and regional (8 km) clear-sky residuals with a scene-mean bias fallback (preventing cold edge drops), and adds a 30 m texture prior regressed on NDVI, MNDWI, elevation and annual LST anomaly. Residuals ignore the cloud-edge halo (150 m, auto-narrowed to 60 m on cloudy scenes), and monthly scenes are harmonized to one level.');
 var stDcaValidationBtn = ui.Button({label: 'Test ST-DCA Accuracy (Artificial Cloud Test)', style: {stretch: 'horizontal'}});
+var stDcaGapSelect = ui.Select({items: ['Small (~300 m)', 'Medium (~1 km blocks)', 'Large (~3 km blocks)'], value: 'Small (~300 m)', style: {stretch: 'horizontal'}});
 var stDcaValidationStatus = lbl('Optional: Click above to hide 20% of clear pixels as fake clouds and test how accurately ST-DCA reconstructs them.', {whiteSpace: 'normal', fontSize: '11px', color: C.muted});
 var stDcaValidationBox = ui.Panel([], null, {backgroundColor: C.bg});
 
@@ -390,6 +391,7 @@ var stDcaMethodPanel = ui.Panel([
   stDcaMethodNote,
   stDcaAdvCheck,
   stDcaAdvPanel,
+  lbl('Artificial gap size for the test'), stDcaGapSelect,
   frame(stDcaValidationBtn, C.accent, 8), stDcaValidationStatus, stDcaValidationBox
 ], null, {backgroundColor: C.card, shown: true});
 
@@ -982,6 +984,13 @@ var ST_DCA_HARMONIZE_MAX_C = 6;      // cap on the per-scene shift (deg C)
 var ST_DCA_SELF_CALIBRATE = true;    // hold-out bias self-calibration
 var ST_DCA_CALIB_MIN_PX = 150;       // min hold-out pixels (at 120 m) needed to trust the correction
 var ST_DCA_CALIB_MAX_C = 3;          // cap on the correction (deg C)
+var ST_DCA_CONTEXT_PAD_M = 5000;      // small AOIs (< 25 km2) borrow context: fits, calibration and covariates use AOI + 5 km pad
+var ST_DCA_CONTEXT_MAX_AREA_M2 = 0;      // context pad DISABLED: runs with the pad showed weak self-calibration and cold bias; set to e.g. 25e6 to re-enable for tiny AOIs
+function ctxGeom(g) {
+  // small AOI: bounding box + pad (non-zero error margin required); large AOI: the AOI itself, no buffer call
+  return ee.Geometry(ee.Algorithms.If(g.area(100).lt(ST_DCA_CONTEXT_MAX_AREA_M2),
+    g.bounds().buffer(ST_DCA_CONTEXT_PAD_M, 100), g));
+}
 var COV_NAMES = ['tex_lst', 'tex_ndvi', 'tex_mndwi', 'tex_elev'];
 
 function nearestEra5AtSceneTime(acquisitionDate, geom, targetProjection) {
@@ -1056,7 +1065,8 @@ function buildSpectralCovariates(year, start, end, geom, radiusM) {
   return ee.Image.cat([texLst, texNdvi, texMndwi, texElev]);
 }
 
-function fillThermalGaps(landsatLST, acquisitionDate, geom, radiusM, iterations, covariates) {
+function fillThermalGaps(landsatLST, acquisitionDate, aoiGeom, radiusM, iterations, covariates) {
+  var geom = ctxGeom(aoiGeom);   // all fitting runs on AOI + pad; callers clip the output to the AOI
   var targetProjection = landsatLST.projection();
   var kernelProj = targetProjection.atScale(ST_DCA_KERNEL_SCALE);
   var era = nearestEra5AtSceneTime(acquisitionDate, geom, targetProjection);
@@ -1227,13 +1237,16 @@ function fillThermalGaps(landsatLST, acquisitionDate, geom, radiusM, iterations,
 
 function fillThermalGapsCollection(year, start, end, geom, maxCloud, radiusM, iterations, useSharpen) {
   // Scenes with too few clear pixels cannot give a usable residual: skip them instead of filling with raw ERA5
-  var scenes = landsatCol(start, end, geom, maxCloud).select('ST').map(function(im) {
+  // If no scene passes the cloud slider, retry without it: the 10% AOI valid-pixel guard below is the real quality filter
+  var primaryCol = landsatCol(start, end, geom, maxCloud);
+  var scenesRaw = ee.ImageCollection(ee.Algorithms.If(primaryCol.size().gt(0), primaryCol, landsatCol(start, end, geom, 100)));
+  var scenes = scenesRaw.select('ST').map(function(im) {
     var d = im.select('ST').mask().unmask(0).rename('v').reduceRegion({
       reducer: ee.Reducer.mean(), geometry: geom, scale: 120, maxPixels: 1e9, bestEffort: true, tileScale: 4
     }).get('v');
     return im.set('valid_frac', ee.Number(ee.Algorithms.If(ee.Algorithms.IsEqual(d, null), 0, d)));
   }).filter(ee.Filter.gte('valid_frac', ST_DCA_VALID_MIN_FRAC));
-  var cov = useSharpen ? buildSpectralCovariates(year, start, end, geom, radiusM) : null;
+  var cov = useSharpen ? buildSpectralCovariates(year, start, end, ctxGeom(geom), radiusM) : null;
   var processedRaw = scenes.map(function(scene) {
     var acquisitionDate = ee.Date(scene.get('system:time_start'));
     var dca = fillThermalGaps(scene.select('ST'), acquisitionDate, geom, radiusM, iterations, cov);
@@ -1281,12 +1294,12 @@ function fillThermalGapsCollection(year, start, end, geom, maxCloud, radiusM, it
     processed.select('ST_DCA_era5_fallback').sum(),
     ee.Image.constant(0).rename('ST_DCA_era5_fallback').setDefaultProjection(fallbackProjection)));
   return {
-    filled: composite.select('ST_filled').rename('ST'),
-    original: composite.select('ST_original'),
-    era5: composite.select('ERA5_skin_C'),
-    offset: composite.select('ST_DCA_offset'),
-    netSolar: composite.select('ERA5_net_solar_Wm2'),
-    totalEvap: composite.select('ERA5_total_evap_mm_h'),
+    filled: composite.select('ST_filled').rename('ST').clip(geom),
+    original: composite.select('ST_original').clip(geom),
+    era5: composite.select('ERA5_skin_C').clip(geom),
+    offset: composite.select('ST_DCA_offset').clip(geom),
+    netSolar: composite.select('ERA5_net_solar_Wm2').clip(geom),
+    totalEvap: composite.select('ERA5_total_evap_mm_h').clip(geom),
     localFillCount: localFillCount,
     eraFallbackCount: eraFallbackCount,
     landsatSceneCount: scenes.size(),
@@ -1309,7 +1322,7 @@ function pseudoValidationMetrics(prediction, truth, geom, scale) {
   ]);
   var sums = ee.Dictionary(statsImage.reduceRegion({
     reducer: ee.Reducer.sum(), geometry: geom, scale: scale,
-    maxPixels: 1e10, bestEffort: true, tileScale: 4
+    maxPixels: 3e6, bestEffort: true, tileScale: 4
   }));
   function safeSum(key) {
     var value = sums.get(key, 0);
@@ -1338,7 +1351,8 @@ function runStDcaPseudoValidation() {
   var month = parseInt(monthSelect.getValue(), 10);
   var start = ee.Date.fromYMD(year, month, 1);
   var end = start.advance(1, 'month');
-  var candidates = landsatCol(start, end, a.geom, cloudSlider.getValue());
+  // Scene-level CLOUD_COVER covers the whole 185 km scene, not your AOI. The best scene is picked below by AOI-specific valid pixels, so no slider prefilter here.
+  var candidates = landsatCol(start, end, a.geom, 100);
   candidates.size().evaluate(function(count, err) {
     if (err || !count) {
       stDcaValidationStatus.setValue('No quality-screened Landsat scene is available for this AOI and month. ' + (err || ''));
@@ -1347,7 +1361,7 @@ function runStDcaPseudoValidation() {
     var scoredCandidates = candidates.map(function(im) {
       var validFraction = im.select('ST').mask().unmask(0).rename('valid')
         .reduceRegion({reducer: ee.Reducer.mean(), geometry: a.geom, scale: 30,
-          maxPixels: 1e10, bestEffort: true, tileScale: 4}).get('valid');
+          maxPixels: 3e6, bestEffort: true, tileScale: 4}).get('valid');
       return im.set('valid_lST_fraction', validFraction);
     }).sort('valid_lST_fraction', false);
     var scene = ee.Image(scoredCandidates.first());
@@ -1355,7 +1369,7 @@ function runStDcaPseudoValidation() {
     var targetProjection = truthFull.projection();
     var validFractionImage = truthFull.mask().unmask(0, false).rename('valid')
       .reduceRegion({reducer: ee.Reducer.mean(), geometry: a.geom, scale: 30,
-        maxPixels: 1e10, bestEffort: true, tileScale: 4});
+        maxPixels: 3e6, bestEffort: true, tileScale: 4});
     validFractionImage.evaluate(function(v, e2) {
       if (!v || e2 || v.valid === null || v.valid < ST_DCA_VALID_MIN_FRAC) {
         var pct = v && v.valid !== null ? (100 * v.valid).toFixed(1) : 'unknown';
@@ -1363,27 +1377,62 @@ function runStDcaPseudoValidation() {
         return;
       }
       stDcaValidationStatus.setValue('Creating distributed 20% artificial cloud patches and testing ST-DCA reconstruction...');
-      var pseudoField = ee.Image.random(1862).reproject({crs: targetProjection, scale: 180})
-        .focalMean(240, 'circle', 'meters', 1).rename('pseudo_cloud_field');
-      var pctDict = pseudoField.reduceRegion({
-        reducer: ee.Reducer.percentile([80]), geometry: a.geom, scale: 180,
-        maxPixels: 1e9, bestEffort: true, tileScale: 4
-      });
-      var percentile = ee.Number(ee.Algorithms.If(pctDict.values().size().gt(0), pctDict.values().get(0), 0.5));
+      var gapChoice = stDcaGapSelect.getValue();
+      var gapCfg = {'Small (~300 m)': {s: 180, r: 240, blocks: false}, 'Medium (~1 km blocks)': {s: 1000, r: 0, blocks: true},
+        'Large (~3 km blocks)': {s: 3000, r: 0, blocks: true}}[gapChoice] || {s: 180, r: 240, blocks: false};
+      var pseudoField, percentile;
+      if (gapCfg.blocks) {
+        // Medium and large gaps: random square blocks on a coarse grid; a uniform random value >= 0.8 hides 20% of the blocks
+        pseudoField = ee.Image.random(1862).reproject({crs: targetProjection.atScale(gapCfg.s)}).rename('pseudo_cloud_field');
+        percentile = ee.Number(0.8);
+      } else {
+        pseudoField = ee.Image.random(1862).reproject({crs: targetProjection, scale: gapCfg.s})
+          .focalMean(gapCfg.r, 'circle', 'meters', 1).rename('pseudo_cloud_field');
+        var pctDict = pseudoField.reduceRegion({
+          reducer: ee.Reducer.percentile([80]), geometry: a.geom, scale: gapCfg.s,
+          maxPixels: 1e9, bestEffort: true, tileScale: 4
+        });
+        percentile = ee.Number(ee.Algorithms.If(pctDict.values().size().gt(0), pctDict.values().get(0), 0.5));
+      }
       var validMask = truthFull.mask().unmask(0, false).gt(0);
       var pseudoCloud = pseudoField.gte(percentile).and(validMask).unmask(0, false).rename('pseudo_cloud');
       var maskedScene = truthFull.updateMask(pseudoCloud.not()).rename('ST');
       var acquisitionDate = ee.Date(scene.get('system:time_start'));
       var radiusM = Number(stDcaRadiusSlider.getValue());
-      var tex = stDcaSharpenCheck.getValue() ? buildSpectralCovariates(year, start, end, a.geom, radiusM) : null;
+      var tex = stDcaSharpenCheck.getValue() ? buildSpectralCovariates(year, start, end, ctxGeom(a.geom), radiusM) : null;
       var dca = fillThermalGaps(maskedScene, acquisitionDate, a.geom,
         radiusM, parseInt(stDcaIterationsSelect.getValue(), 10), tex);
       var hiddenTruth = truthFull.updateMask(pseudoCloud).rename('truth');
       var stDcaPrediction = dca.filled.updateMask(pseudoCloud).rename('prediction');
       var era5Prediction = dca.era5.updateMask(pseudoCloud).rename('prediction');
-      var scale = 30;
+      // ---- Simple baselines evaluated on the same withheld pixels ----
+      // Baseline A: ERA5 plus one scene-mean offset (mean Landsat minus ERA5 over the visible pixels)
+      var offDict = maskedScene.subtract(dca.era5).rename('off').reduceRegion({
+        reducer: ee.Reducer.mean(), geometry: a.geom, scale: 30, maxPixels: 3e6, bestEffort: true, tileScale: 4
+      });
+      var sceneOffset = ee.Number(ee.Algorithms.If(ee.Algorithms.IsEqual(offDict.get('off'), null), 0, offDict.get('off')));
+      var offsetPrediction = dca.era5.add(ee.Image.constant(sceneOffset)).updateMask(pseudoCloud).rename('prediction');
+      // Baseline B: spatial interpolation of the visible Landsat LST (Gaussian-weighted normalised convolution,
+      // 1.5 km radius, 500 m sigma); the scene mean is used where no visible pixel is within reach
+      var p90 = targetProjection.atScale(90);
+      var visMaskF = maskedScene.mask().unmask(0).toFloat().reproject({crs: p90});
+      var visValF = maskedScene.unmask(0).toFloat().reproject({crs: p90});
+      var gSigma = Math.max(500, 0.6 * gapCfg.s), gRadius = Math.max(1500, 3 * gSigma);
+      var gKernel = ee.Kernel.gaussian({radius: gRadius, sigma: gSigma, units: 'meters', normalize: false});
+      var iNum = visValF.convolve(gKernel).reproject({crs: p90}).resample('bilinear');
+      var iDen = visMaskF.convolve(gKernel).reproject({crs: p90}).resample('bilinear');
+      var lstMeanDict = maskedScene.rename('ST').reduceRegion({
+        reducer: ee.Reducer.mean(), geometry: a.geom, scale: 30, maxPixels: 3e6, bestEffort: true, tileScale: 4
+      });
+      var sceneMeanLst = ee.Number(ee.Algorithms.If(ee.Algorithms.IsEqual(lstMeanDict.get('ST'), null), 0, lstMeanDict.get('ST')));
+      var interpPrediction = iNum.divide(iDen.max(1e-9))
+        .where(iDen.lt(0.02), ee.Image.constant(sceneMeanLst))
+        .updateMask(pseudoCloud).rename('prediction');
+      var scale = gapCfg.s > 200 ? 60 : 30;   // medium and large gaps are sampled at 60 m to stay within the compute limit
       var dcaMetrics = pseudoValidationMetrics(stDcaPrediction, hiddenTruth, a.geom, scale);
       var eraMetrics = pseudoValidationMetrics(era5Prediction, hiddenTruth, a.geom, scale);
+      var offsetMetrics = pseudoValidationMetrics(offsetPrediction, hiddenTruth, a.geom, scale);
+      var interpMetrics = pseudoValidationMetrics(interpPrediction, hiddenTruth, a.geom, scale);
       var cloudFraction = pseudoCloud.unmask(0).reduceRegion({reducer: ee.Reducer.mean(),
         geometry: a.geom, scale: 180, maxPixels: 1e9, bestEffort: true, tileScale: 4}).get('pseudo_cloud');
       var report = ee.Dictionary({
@@ -1403,8 +1452,11 @@ function runStDcaPseudoValidation() {
         core_fraction: dca.coreFrac,
         scene_mean_bias_c: dca.sceneMeanBias,
         st_dca: dcaMetrics,
-        era5_raw: eraMetrics
+        era5_raw: eraMetrics,
+        gap_label: gapChoice
       });
+      // Baselines are evaluated in a second request so that one request does not hit the compute time limit
+      var baseReport = ee.Dictionary({base_offset: offsetMetrics, base_interp: interpMetrics, base_offset_value_c: sceneOffset});
       report.evaluate(function(r, e3) {
         stDcaValidationBox.clear();
         if (!r || e3) {
@@ -1416,7 +1468,7 @@ function runStDcaPseudoValidation() {
         t.add(wl('Landsat scene: ' + (r.landsat_product_id || 'ID unavailable')));
         t.add(wl('Acquisition (UTC): ' + r.acquisition_utc + ' (ERA5 diff: ' + Number(r.era5_nearest_time_offset_min).toFixed(1) + ' min)'));
         t.add(wl('Clear-sky: ' + (100 * r.valid_landsat_fraction).toFixed(1) + '%  ·  Test gap: ' + (100 * Number(r.pseudo_cloud_fraction || 0)).toFixed(1) + '%  ·  Alpha: ' + Number(r.alpha_weight || 0.45).toFixed(2)));
-        if (r.beta) { t.add(wl('Covariate weights: NDVI ' + Number(r.beta.ndvi).toFixed(2) + '  ·  MNDWI ' + Number(r.beta.mndwi).toFixed(2) + '  ·  Elev ' + Number(r.beta.elev).toFixed(4) + ' per m  ·  Self-calibration: ' + Number(r.bias_correction_c || 0).toFixed(2) + ' °C  ·  Edge-safe clear: ' + (100 * Number(r.core_fraction || 0)).toFixed(1) + '%', {fontSize: '11px', color: C.muted})); }
+        if (r.beta) { t.add(wl('Covariate weights: NDVI ' + Number(r.beta.ndvi).toFixed(2) + '  ·  MNDWI ' + Number(r.beta.mndwi).toFixed(2) + '  ·  Elev ' + Number(r.beta.elev).toFixed(4) + ' per m  ·  Self-calibration: ' + Number(r.bias_correction_c || 0).toFixed(2) + ' °C  ·  Gap size: ' + (r.gap_label || 'Small (~300 m)') + '  ·  Edge-safe clear: ' + (100 * Number(r.core_fraction || 0)).toFixed(1) + '%', {fontSize: '11px', color: C.muted})); }
         t.add(lbl('1. Your ST-DCA Reconstruction', {fontWeight: 'bold', color: C.accent, margin: '8px 0 2px 0'}));
         ['mae_c', 'rmse_c', 'bias_c', 'r2', 'n'].forEach(function(k) {
           t.add(wl(k.toUpperCase() + ': ' + (r.st_dca[k] === null ? 'not available' :
@@ -1427,6 +1479,9 @@ function runStDcaPseudoValidation() {
           t.add(wl(k.toUpperCase() + ': ' + (r.era5_raw[k] === null ? 'not available' :
             (k === 'n' ? Math.round(r.era5_raw[k]) + ' px' : Number(r.era5_raw[k]).toFixed(3) + (k === 'r2' ? '' : ' °C')))));
         });
+        if (!r.st_dca.n) {
+          t.add(wl('No withheld pixels were created for this gap size (the AOI is too small, or the random blocks missed the clear area). Try a smaller gap size or a larger AOI.', {color: C.muted}));
+        }
         stDcaValidationBox.add(t);
 
         map.addLayer(pseudoCloud.selfMask(), {palette: ['ff00ff']}, 'Validation: Artificial cloud mask', false);
@@ -1435,6 +1490,25 @@ function runStDcaPseudoValidation() {
         map.addLayer(stDcaPrediction.subtract(hiddenTruth).rename('ST_DCA_error'),
           {min: -5, max: 5, palette: ['313695','74add1','ffffbf','f46d43','a50026']},
           'Validation: ST-DCA error (°C)', false);
+        stDcaValidationStatus.setValue('Main metrics ready. Computing the simple baselines A and B...');
+        baseReport.evaluate(function(rb, eb) {
+          var baseOk = !!rb && !eb;
+          var bo = (baseOk && rb.base_offset) ? rb.base_offset : {};
+          var bi = (baseOk && rb.base_interp) ? rb.base_interp : {};
+          var offVal = baseOk ? rb.base_offset_value_c : null;
+          if (baseOk) {
+            [['3. Baseline A: ERA5 + scene-mean offset (' + (offVal === null ? 'n/a' : Number(offVal).toFixed(2) + ' °C') + ')', bo],
+             ['4. Baseline B: spatial interpolation of visible Landsat LST', bi]].forEach(function(b) {
+              t.add(lbl(b[0], {fontWeight: 'bold', color: C.muted, margin: '8px 0 2px 0'}));
+              ['mae_c', 'rmse_c', 'bias_c', 'r2', 'n'].forEach(function(k) {
+                t.add(wl(k.toUpperCase() + ': ' + (!b[1] || b[1][k] === undefined || b[1][k] === null ? 'not available' :
+                  (k === 'n' ? Math.round(b[1][k]) + ' px' : Number(b[1][k]).toFixed(3) + (k === 'r2' ? '' : ' °C')))));
+              });
+            });
+          } else {
+            t.add(wl('Baselines A and B could not be computed: ' + (eb || 'try a smaller AOI or a smaller gap size.'), {color: C.muted}));
+          }
+          stDcaValidationStatus.setValue('Validation complete! See how ST-DCA compares against raw ERA5-Land and the simple baselines below:');
         csvLink(stDcaValidationBox, ee.FeatureCollection([ee.Feature(null, {
           app_version: r.app_version, study_area: r.study_area, year: r.year, month: r.month,
           landsat_product_id: r.landsat_product_id, acquisition_utc: r.acquisition_utc,
@@ -1447,8 +1521,15 @@ function runStDcaPseudoValidation() {
           st_dca_n: r.st_dca.n, st_dca_mae_c: r.st_dca.mae_c, st_dca_rmse_c: r.st_dca.rmse_c,
           st_dca_bias_c: r.st_dca.bias_c, st_dca_r2: r.st_dca.r2,
           era5_raw_n: r.era5_raw.n, era5_raw_mae_c: r.era5_raw.mae_c, era5_raw_rmse_c: r.era5_raw.rmse_c,
-          era5_raw_bias_c: r.era5_raw.bias_c, era5_raw_r2: r.era5_raw.r2
+          era5_raw_bias_c: r.era5_raw.bias_c, era5_raw_r2: r.era5_raw.r2,
+          gap_size: r.gap_label,
+          base_offset_value_c: offVal,
+          base_offset_mae_c: (bo.mae_c === undefined ? null : bo.mae_c), base_offset_rmse_c: (bo.rmse_c === undefined ? null : bo.rmse_c),
+          base_offset_bias_c: (bo.bias_c === undefined ? null : bo.bias_c), base_offset_r2: (bo.r2 === undefined ? null : bo.r2),
+          base_interp_mae_c: (bi.mae_c === undefined ? null : bi.mae_c), base_interp_rmse_c: (bi.rmse_c === undefined ? null : bi.rmse_c),
+          base_interp_bias_c: (bi.bias_c === undefined ? null : bi.bias_c), base_interp_r2: (bi.r2 === undefined ? null : bi.r2)
         })]), 'TerraLens_ST_DCA_validation', 'Download validation metrics CSV');
+        });
       });
     });
   });
